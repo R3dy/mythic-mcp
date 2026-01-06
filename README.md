@@ -1,6 +1,6 @@
 # Mythic MCP Server
 
-A high-capability MCP server for Mythic C2 using the Mythic Python SDK. It exposes operator-grade tools for tasking, payloads, callbacks, files, credentials, operations, analytics, and real-time subscriptions.
+A high-capability (super vibe coded) MCP server for Mythic C2 using the Mythic Python SDK. It exposes operator-grade tools for tasking, payloads, callbacks, files, credentials, operations, analytics, and real-time subscriptions.
 
 ## Quick start
 
