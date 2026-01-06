@@ -1,0 +1,1 @@
+"""Mythic MCP server package."""
