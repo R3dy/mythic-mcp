@@ -1,0 +1,13 @@
+mythic:
+  server_ip: "127.0.0.1"
+  server_port: 7443
+  ssl: true
+  username: "mythic_admin"
+  password: "mythic_password"
+  apitoken: ""
+  timeout: -1
+  logging_level: 20
+
+mcp:
+  name: "mythic_mcp"
+  instructions: "Mythic C2 operator tools for MCP"

@@ -1,0 +1,3 @@
+fastmcp>=2.0.0
+mythic>=0.2.10
+PyYAML>=6.0
