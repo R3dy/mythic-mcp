@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Dict, List, Optional, Union
 
+import yaml
 from fastmcp import FastMCP, Context
 from mythic import mythic
 
@@ -86,13 +88,14 @@ def _build_server(config: AppConfig) -> FastMCP:
 
     @mcp.tool()
     async def get_callback_details(ctx: Context, callback_display_id: int) -> Dict[str, Any]:
-        """Fetch detailed callback information and recent tasks."""
+        """Fetch detailed callback information including C2 profile and recent tasks."""
         await _ensure_connection(ctx)
         query = """
         query GetCallbackDetails($callback_id: Int!) {
             callback(where: {display_id: {_eq: $callback_id}}) {
                 id
                 display_id
+                active
                 host
                 user
                 domain
@@ -108,6 +111,21 @@ def _build_server(config: AppConfig) -> FastMCP:
                 payload {
                     uuid
                     payloadtype { name }
+                }
+                c2profileparametersinstances {
+                    c2_profile_id
+                    c2profile {
+                        name
+                        is_p2p
+                        running
+                    }
+                    enc_key
+                    dec_key
+                    value
+                    c2profileparameter {
+                        name
+                        key
+                    }
                 }
                 tasks(order_by: {id: desc}, limit: 10) {
                     id
@@ -128,7 +146,100 @@ def _build_server(config: AppConfig) -> FastMCP:
         callbacks = result.get("callback", [])
         if not callbacks:
             return {"error": f"No callback found for display_id={callback_display_id}"}
-        return callbacks[0]
+        cb = callbacks[0]
+        # Summarize C2 profiles from parameter instances
+        c2_profiles: Dict[str, Any] = {}
+        for inst in cb.pop("c2profileparametersinstances", []):
+            profile = inst.get("c2profile", {})
+            profile_name = profile.get("name", "unknown")
+            if profile_name not in c2_profiles:
+                c2_profiles[profile_name] = {
+                    "c2_profile_id": inst.get("c2_profile_id"),
+                    "name": profile_name,
+                    "is_p2p": profile.get("is_p2p", False),
+                    "running": profile.get("running", False),
+                    "parameters": {},
+                }
+            param = inst.get("c2profileparameter", {})
+            param_name = param.get("name") or param.get("key", "")
+            if param_name:
+                c2_profiles[profile_name]["parameters"][param_name] = inst.get("value")
+        cb["c2_profiles"] = list(c2_profiles.values())
+        return cb
+
+    @mcp.tool()
+    async def get_callback_c2_profiles(
+        ctx: Context,
+        callback_display_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Get detailed C2 profile configuration for a specific callback.
+
+        Returns the C2 profiles and their parameter values that the callback
+        is using to communicate. Useful for comparing callbacks to identify
+        duplicates using the same C2 channel.
+
+        Args:
+            callback_display_id: The display ID of the callback.
+        """
+        await _ensure_connection(ctx)
+        query = """
+        query GetCallbackC2Profiles($callback_id: Int!) {
+            callback(where: {display_id: {_eq: $callback_id}}) {
+                id
+                display_id
+                host
+                c2profileparametersinstances {
+                    c2_profile_id
+                    c2profile {
+                        name
+                        is_p2p
+                        running
+                        description
+                    }
+                    value
+                    c2profileparameter {
+                        name
+                        key
+                        description
+                    }
+                }
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"callback_id": callback_display_id},
+        )
+        callbacks = result.get("callback", [])
+        if not callbacks:
+            return {"error": f"No callback found for display_id={callback_display_id}"}
+        cb = callbacks[0]
+        c2_profiles: Dict[str, Any] = {}
+        for inst in cb.get("c2profileparametersinstances", []):
+            profile = inst.get("c2profile", {})
+            profile_name = profile.get("name", "unknown")
+            if profile_name not in c2_profiles:
+                c2_profiles[profile_name] = {
+                    "c2_profile_id": inst.get("c2_profile_id"),
+                    "name": profile_name,
+                    "is_p2p": profile.get("is_p2p", False),
+                    "running": profile.get("running", False),
+                    "description": profile.get("description", ""),
+                    "parameters": {},
+                }
+            param = inst.get("c2profileparameter", {})
+            param_name = param.get("name") or param.get("key", "")
+            if param_name:
+                c2_profiles[profile_name]["parameters"][param_name] = {
+                    "value": inst.get("value"),
+                    "description": param.get("description", ""),
+                }
+        return {
+            "callback_display_id": cb["display_id"],
+            "host": cb["host"],
+            "c2_profiles": list(c2_profiles.values()),
+        }
 
     @mcp.tool()
     async def issue_task(
@@ -1197,6 +1308,697 @@ def _build_server(config: AppConfig) -> FastMCP:
             if len(results) >= max_items:
                 break
         return results
+
+    # ---- Eventing CRUD tools ----
+
+    @mcp.tool()
+    async def create_event_group(
+        ctx: Context,
+        name: str,
+        trigger: str,
+        description: str = "",
+        trigger_data: Optional[Dict[str, Any]] = None,
+        keywords: Optional[List[str]] = None,
+        active: bool = True,
+        environment: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Create a new workflow event group (eventing definition).
+
+        An event group defines a workflow that is triggered by an event in Mythic.
+        After creating the group, add steps with create_event_step.
+
+        Args:
+            name: Unique name for the event group.
+            trigger: Trigger type. One of: "callback_new", "manual", "cron",
+                "mythic_start", "callback_checkin", "payload_build_start",
+                "payload_build_finish", "task_create", "task_finish",
+                "user_output", "task_intercept", "response_intercept", "alert".
+            description: Human-readable description of the workflow.
+            trigger_data: Additional trigger config. Common keys:
+                "payload_types" (list of payload type names to filter on),
+                "selected_os" (list of OS names to filter on).
+            keywords: List of keyword strings that can also trigger this workflow
+                (from UI, agent responses, or callback context menu).
+            active: Whether the event group is active (default True).
+            environment: Default environment variables for all steps.
+        """
+        await _ensure_connection(ctx)
+        obj_parts = [
+            f'name: "{name}"',
+            f'trigger: "{trigger}"',
+            f'description: "{description}"',
+            f"active: {str(active).lower()}",
+        ]
+        variables: Dict[str, Any] = {}
+        var_defs = []
+        if trigger_data is not None:
+            var_defs.append("$trigger_data: jsonb!")
+            obj_parts.append("trigger_data: $trigger_data")
+            variables["trigger_data"] = trigger_data
+        if keywords is not None:
+            var_defs.append("$keywords: jsonb!")
+            obj_parts.append("keywords: $keywords")
+            variables["keywords"] = keywords
+        if environment is not None:
+            var_defs.append("$environment: jsonb!")
+            obj_parts.append("environment: $environment")
+            variables["environment"] = environment
+        var_def_str = f"({', '.join(var_defs)})" if var_defs else ""
+        obj_str = ", ".join(obj_parts)
+        query = f"""
+        mutation CreateEventGroup{var_def_str} {{
+            insert_eventgroup_one(object: {{{obj_str}}}) {{
+                id
+                name
+                description
+                active
+                trigger
+                trigger_data
+                keywords
+            }}
+        }}
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables=variables,
+        )
+        data = result.get("insert_eventgroup_one")
+        if not data:
+            return {"error": "Failed to create event group. Check permissions and that the name is unique."}
+        return data
+
+    @mcp.tool()
+    async def create_event_step(
+        ctx: Context,
+        event_group_id: int,
+        name: str,
+        action: str,
+        action_data: Dict[str, Any],
+        order: int = 0,
+        description: str = "",
+        depends_on: Optional[List[str]] = None,
+        inputs: Optional[Dict[str, str]] = None,
+        outputs: Optional[Dict[str, str]] = None,
+        environment: Optional[Dict[str, str]] = None,
+        continue_on_error: bool = False,
+    ) -> Dict[str, Any]:
+        """Create a new step in a workflow event group.
+
+        Steps define the actions taken when a workflow is triggered. They execute
+        in order, respecting depends_on relationships.
+
+        Args:
+            event_group_id: ID of the event group to add the step to.
+            name: Unique name for this step within the event group.
+            action: Action type. One of: "task_create", "custom_function",
+                "conditional_check", "task_intercept", "response_intercept".
+            action_data: Action-specific configuration.
+                For task_create: {"callback_display_id": "CALLBACK_ID",
+                 "command_name": "cmd", "params": "json_string"}.
+                For custom_function: {"container_name": "hydra",
+                 "function_name": "execute_script"}.
+                For conditional_check: {"container_name": "hydra",
+                 "function_name": "conditional_check", "steps": ["step_name"]}.
+                For task_intercept/response_intercept:
+                 {"container_name": "hydra"}.
+            order: Execution order (0-based, default 0).
+            description: Human-readable description of the step.
+            depends_on: List of step names this step depends on.
+            inputs: Input mapping dict. Keys are placeholders in action_data,
+                values are sources. Supported prefixes:
+                "env.<key>" (trigger environment data, e.g. "env.display_id"),
+                "mythic.apitoken" (per-step API token for GraphQL access),
+                "upload.<filename>" (agent_file_id of uploaded file),
+                "download.<filename>" (agent_file_id of downloaded file),
+                "workflow.<filename>" (file attached to the workflow),
+                "<step_name>.<output_key>" (output from a prior step).
+            outputs: Output mapping dict for passing data to dependent steps.
+            environment: Per-step environment variables.
+            continue_on_error: Whether to continue workflow if this step fails.
+        """
+        await _ensure_connection(ctx)
+        variables: Dict[str, Any] = {
+            "eventgroup_id": event_group_id,
+            "action_data": action_data,
+        }
+        var_defs = [
+            "$eventgroup_id: Int!",
+            "$action_data: jsonb!",
+        ]
+        obj_parts = [
+            "eventgroup_id: $eventgroup_id",
+            f'name: "{name}"',
+            f'action: "{action}"',
+            "action_data: $action_data",
+            f"order: {order}",
+            f'description: "{description}"',
+            f"continue_on_error: {str(continue_on_error).lower()}",
+        ]
+        if depends_on is not None:
+            var_defs.append("$depends_on: jsonb!")
+            obj_parts.append("depends_on: $depends_on")
+            variables["depends_on"] = depends_on
+        if inputs is not None:
+            var_defs.append("$inputs: jsonb!")
+            obj_parts.append("inputs: $inputs")
+            variables["inputs"] = inputs
+        if outputs is not None:
+            var_defs.append("$outputs: jsonb!")
+            obj_parts.append("outputs: $outputs")
+            variables["outputs"] = outputs
+        if environment is not None:
+            var_defs.append("$environment: jsonb!")
+            obj_parts.append("environment: $environment")
+            variables["environment"] = environment
+        var_def_str = f"({', '.join(var_defs)})"
+        obj_str = ", ".join(obj_parts)
+        query = f"""
+        mutation CreateEventStep{var_def_str} {{
+            insert_eventstep_one(object: {{{obj_str}}}) {{
+                id
+                name
+                description
+                action
+                action_data
+                order
+                depends_on
+                inputs
+                outputs
+                environment
+                continue_on_error
+                eventgroup_id
+            }}
+        }}
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables=variables,
+        )
+        data = result.get("insert_eventstep_one")
+        if not data:
+            return {"error": "Failed to create event step. Check that the event group exists and step name is unique within it."}
+        return data
+
+    @mcp.tool()
+    async def update_event_group(
+        ctx: Context,
+        event_group_id: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        trigger: Optional[str] = None,
+        trigger_data: Optional[Dict[str, Any]] = None,
+        keywords: Optional[List[str]] = None,
+        active: Optional[bool] = None,
+        environment: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Update an existing workflow event group's configuration.
+
+        Only provided fields are updated; omitted fields remain unchanged.
+
+        Args:
+            event_group_id: The ID of the event group to update.
+            name: New name for the event group.
+            description: New description.
+            trigger: New trigger type.
+            trigger_data: New trigger configuration data.
+            keywords: New list of keywords.
+            active: Whether the group is active.
+            environment: New default environment variables.
+        """
+        await _ensure_connection(ctx)
+        set_parts = []
+        variables: Dict[str, Any] = {"id": event_group_id}
+        var_defs = ["$id: Int!"]
+        if name is not None:
+            set_parts.append("name: $name")
+            var_defs.append("$name: String!")
+            variables["name"] = name
+        if description is not None:
+            set_parts.append("description: $description")
+            var_defs.append("$description: String!")
+            variables["description"] = description
+        if trigger is not None:
+            set_parts.append("trigger: $trigger")
+            var_defs.append("$trigger: String!")
+            variables["trigger"] = trigger
+        if trigger_data is not None:
+            set_parts.append("trigger_data: $trigger_data")
+            var_defs.append("$trigger_data: jsonb!")
+            variables["trigger_data"] = trigger_data
+        if keywords is not None:
+            set_parts.append("keywords: $keywords")
+            var_defs.append("$keywords: jsonb!")
+            variables["keywords"] = keywords
+        if active is not None:
+            set_parts.append("active: $active")
+            var_defs.append("$active: Boolean!")
+            variables["active"] = active
+        if environment is not None:
+            set_parts.append("environment: $environment")
+            var_defs.append("$environment: jsonb!")
+            variables["environment"] = environment
+        if not set_parts:
+            return {"error": "No fields provided to update."}
+        set_str = ", ".join(set_parts)
+        var_def_str = f"({', '.join(var_defs)})"
+        query = f"""
+        mutation UpdateEventGroup{var_def_str} {{
+            update_eventgroup_by_pk(
+                pk_columns: {{id: $id}},
+                _set: {{{set_str}}}
+            ) {{
+                id
+                name
+                description
+                active
+                trigger
+                trigger_data
+                keywords
+            }}
+        }}
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables=variables,
+        )
+        data = result.get("update_eventgroup_by_pk")
+        if not data:
+            return {"error": f"No event group found with id={event_group_id}"}
+        return data
+
+    @mcp.tool()
+    async def update_event_step(
+        ctx: Context,
+        event_step_id: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        action: Optional[str] = None,
+        action_data: Optional[Dict[str, Any]] = None,
+        order: Optional[int] = None,
+        depends_on: Optional[List[str]] = None,
+        inputs: Optional[Dict[str, str]] = None,
+        outputs: Optional[Dict[str, str]] = None,
+        environment: Optional[Dict[str, str]] = None,
+        continue_on_error: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Update an existing workflow event step's configuration.
+
+        Only provided fields are updated; omitted fields remain unchanged.
+
+        Args:
+            event_step_id: The ID of the event step to update.
+            name: New step name.
+            description: New description.
+            action: New action type ("task_create", "custom_function", "conditional_check").
+            action_data: New action configuration.
+            order: New execution order.
+            depends_on: New dependency list (step names).
+            inputs: New input mappings.
+            outputs: New output mappings.
+            environment: New per-step environment variables.
+            continue_on_error: Whether to continue on error.
+        """
+        await _ensure_connection(ctx)
+        set_parts = []
+        variables: Dict[str, Any] = {"id": event_step_id}
+        var_defs = ["$id: Int!"]
+        if name is not None:
+            set_parts.append("name: $name")
+            var_defs.append("$name: String!")
+            variables["name"] = name
+        if description is not None:
+            set_parts.append("description: $description")
+            var_defs.append("$description: String!")
+            variables["description"] = description
+        if action is not None:
+            set_parts.append("action: $action")
+            var_defs.append("$action: String!")
+            variables["action"] = action
+        if action_data is not None:
+            set_parts.append("action_data: $action_data")
+            var_defs.append("$action_data: jsonb!")
+            variables["action_data"] = action_data
+        if order is not None:
+            set_parts.append("order: $order")
+            var_defs.append("$order: Int!")
+            variables["order"] = order
+        if depends_on is not None:
+            set_parts.append("depends_on: $depends_on")
+            var_defs.append("$depends_on: jsonb!")
+            variables["depends_on"] = depends_on
+        if inputs is not None:
+            set_parts.append("inputs: $inputs")
+            var_defs.append("$inputs: jsonb!")
+            variables["inputs"] = inputs
+        if outputs is not None:
+            set_parts.append("outputs: $outputs")
+            var_defs.append("$outputs: jsonb!")
+            variables["outputs"] = outputs
+        if environment is not None:
+            set_parts.append("environment: $environment")
+            var_defs.append("$environment: jsonb!")
+            variables["environment"] = environment
+        if continue_on_error is not None:
+            set_parts.append("continue_on_error: $continue_on_error")
+            var_defs.append("$continue_on_error: Boolean!")
+            variables["continue_on_error"] = continue_on_error
+        if not set_parts:
+            return {"error": "No fields provided to update."}
+        set_str = ", ".join(set_parts)
+        var_def_str = f"({', '.join(var_defs)})"
+        query = f"""
+        mutation UpdateEventStep{var_def_str} {{
+            update_eventstep_by_pk(
+                pk_columns: {{id: $id}},
+                _set: {{{set_str}}}
+            ) {{
+                id
+                name
+                description
+                action
+                action_data
+                order
+                depends_on
+                inputs
+                outputs
+                environment
+                continue_on_error
+                eventgroup_id
+            }}
+        }}
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables=variables,
+        )
+        data = result.get("update_eventstep_by_pk")
+        if not data:
+            return {"error": f"No event step found with id={event_step_id}"}
+        return data
+
+    @mcp.tool()
+    async def delete_event_group(
+        ctx: Context,
+        event_group_id: int,
+    ) -> Dict[str, Any]:
+        """Delete a workflow event group and all its steps.
+
+        This permanently removes the event group definition and all associated
+        event steps. Event group instances (execution history) are preserved.
+
+        Args:
+            event_group_id: The ID of the event group to delete.
+        """
+        await _ensure_connection(ctx)
+        # Delete steps first, then the group
+        delete_steps_query = """
+        mutation DeleteEventSteps($eventgroup_id: Int!) {
+            delete_eventstep(where: {eventgroup_id: {_eq: $eventgroup_id}}) {
+                affected_rows
+            }
+        }
+        """
+        steps_result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=delete_steps_query,
+            variables={"eventgroup_id": event_group_id},
+        )
+        steps_deleted = (
+            steps_result.get("delete_eventstep", {}).get("affected_rows", 0)
+        )
+        delete_group_query = """
+        mutation DeleteEventGroup($id: Int!) {
+            delete_eventgroup_by_pk(id: $id) {
+                id
+                name
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=delete_group_query,
+            variables={"id": event_group_id},
+        )
+        data = result.get("delete_eventgroup_by_pk")
+        if not data:
+            return {"error": f"No event group found with id={event_group_id}"}
+        return {
+            "deleted_group": data,
+            "steps_deleted": steps_deleted,
+        }
+
+    @mcp.tool()
+    async def delete_event_step(
+        ctx: Context,
+        event_step_id: int,
+    ) -> Dict[str, Any]:
+        """Delete a single step from a workflow event group.
+
+        Args:
+            event_step_id: The ID of the event step to delete.
+        """
+        await _ensure_connection(ctx)
+        query = """
+        mutation DeleteEventStep($id: Int!) {
+            delete_eventstep_by_pk(id: $id) {
+                id
+                name
+                eventgroup_id
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"id": event_step_id},
+        )
+        data = result.get("delete_eventstep_by_pk")
+        if not data:
+            return {"error": f"No event step found with id={event_step_id}"}
+        return data
+
+    @mcp.tool()
+    async def import_event_group(
+        ctx: Context,
+        workflow_definition: str,
+        format: str = "yaml",
+        active: bool = True,
+    ) -> Dict[str, Any]:
+        """Import a complete workflow event group from a YAML, JSON, or TOML definition.
+
+        Parses a workflow definition string (in the same format used by Mythic's
+        eventing system and the Pantheon project) and creates the event group
+        and all its steps.
+
+        The expected structure matches Mythic's eventing file format:
+            name: "Workflow Name"
+            description: "What it does"
+            trigger: callback_new
+            trigger_data:
+              payload_types: [apollo]
+            keywords: [keyword1]
+            environment: {}
+            steps:
+              - name: "Step 1"
+                action: task_create
+                inputs:
+                  CALLBACK_ID: env.display_id
+                action_data:
+                  callback_display_id: CALLBACK_ID
+                  command_name: whoami
+                depends_on: []
+                continue_on_error: false
+
+        Args:
+            workflow_definition: The workflow definition string.
+            format: Format of the definition: "yaml", "json", or "toml" (default "yaml").
+            active: Whether the imported group should be active (default True).
+        """
+        await _ensure_connection(ctx)
+        if format == "yaml":
+            defn = yaml.safe_load(workflow_definition)
+        elif format == "json":
+            defn = json.loads(workflow_definition)
+        elif format == "toml":
+            import tomllib
+            defn = tomllib.loads(workflow_definition)
+        else:
+            return {"error": f"Unsupported format: {format}. Use 'yaml', 'json', or 'toml'."}
+
+        if not isinstance(defn, dict):
+            return {"error": "Workflow definition must be a mapping/object at the top level."}
+
+        # Build the event group object for insertion
+        group_obj: Dict[str, Any] = {
+            "name": defn.get("name", "Unnamed Workflow"),
+            "description": defn.get("description", ""),
+            "trigger": defn.get("trigger", "manual"),
+            "active": active,
+        }
+        if "trigger_data" in defn:
+            group_obj["trigger_data"] = defn["trigger_data"]
+        if "keywords" in defn:
+            group_obj["keywords"] = defn["keywords"]
+        if "environment" in defn:
+            group_obj["environment"] = defn["environment"]
+
+        # Build steps with nested insert
+        steps = defn.get("steps", [])
+        step_objects = []
+        for idx, step in enumerate(steps):
+            step_obj: Dict[str, Any] = {
+                "name": step.get("name", f"step_{idx}"),
+                "action": step.get("action", "task_create"),
+                "order": idx,
+            }
+            if "description" in step:
+                step_obj["description"] = step["description"]
+            if "action_data" in step:
+                ad = step["action_data"]
+                # Ensure params is a string (YAML may parse it as dict)
+                if "params" in ad and not isinstance(ad["params"], str):
+                    ad["params"] = json.dumps(ad["params"])
+                step_obj["action_data"] = ad
+            if "depends_on" in step:
+                step_obj["depends_on"] = step["depends_on"]
+            if "inputs" in step:
+                step_obj["inputs"] = step["inputs"]
+            if "outputs" in step:
+                step_obj["outputs"] = step["outputs"]
+            if "environment" in step:
+                step_obj["environment"] = step["environment"]
+            if "continue_on_error" in step:
+                step_obj["continue_on_error"] = step["continue_on_error"]
+            step_objects.append(step_obj)
+
+        if step_objects:
+            group_obj["eventsteps"] = {"data": step_objects}
+
+        query = """
+        mutation ImportEventGroup($object: eventgroup_insert_input!) {
+            insert_eventgroup_one(object: $object) {
+                id
+                name
+                description
+                active
+                trigger
+                trigger_data
+                keywords
+                eventsteps(order_by: {order: asc}) {
+                    id
+                    name
+                    action
+                    action_data
+                    order
+                    depends_on
+                    inputs
+                    outputs
+                    continue_on_error
+                }
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"object": group_obj},
+        )
+        data = result.get("insert_eventgroup_one")
+        if not data:
+            return {"error": "Failed to import event group. Check the definition format and permissions."}
+        return data
+
+    @mcp.tool()
+    async def export_event_group(
+        ctx: Context,
+        event_group_id: int,
+        format: str = "yaml",
+    ) -> Union[str, Dict[str, Any]]:
+        """Export a workflow event group as a YAML or JSON definition string.
+
+        Produces a definition compatible with Mythic's eventing file format
+        and the Pantheon project. Can be saved to a file and re-imported.
+
+        Args:
+            event_group_id: The ID of the event group to export.
+            format: Output format: "yaml" or "json" (default "yaml").
+        """
+        await _ensure_connection(ctx)
+        query = """
+        query ExportEventGroup($id: Int!) {
+            eventgroup_by_pk(id: $id) {
+                name
+                description
+                trigger
+                trigger_data
+                keywords
+                eventsteps(order_by: {order: asc}) {
+                    name
+                    description
+                    action
+                    action_data
+                    order
+                    depends_on
+                    inputs
+                    outputs
+                    environment
+                    continue_on_error
+                }
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"id": event_group_id},
+        )
+        data = result.get("eventgroup_by_pk")
+        if not data:
+            return {"error": f"No event group found with id={event_group_id}"}
+
+        # Build clean export structure
+        export: Dict[str, Any] = {
+            "name": data["name"],
+            "description": data.get("description", ""),
+            "trigger": data["trigger"],
+        }
+        if data.get("trigger_data"):
+            export["trigger_data"] = data["trigger_data"]
+        if data.get("keywords"):
+            export["keywords"] = data["keywords"]
+        export["environment"] = {}
+
+        steps = []
+        for step in data.get("eventsteps", []):
+            step_export: Dict[str, Any] = {
+                "name": step["name"],
+            }
+            if step.get("description"):
+                step_export["description"] = step["description"]
+            if step.get("continue_on_error"):
+                step_export["continue_on_error"] = step["continue_on_error"]
+            if step.get("inputs"):
+                step_export["inputs"] = step["inputs"]
+            step_export["action"] = step["action"]
+            if step.get("depends_on"):
+                step_export["depends_on"] = step["depends_on"]
+            if step.get("action_data"):
+                step_export["action_data"] = step["action_data"]
+            if step.get("environment"):
+                step_export["environment"] = step["environment"]
+            if step.get("outputs"):
+                step_export["outputs"] = step["outputs"]
+            steps.append(step_export)
+
+        export["steps"] = steps
+
+        if format == "json":
+            return {"format": "json", "definition": json.dumps(export, indent=2)}
+        return {"format": "yaml", "definition": yaml.dump(export, default_flow_style=False, sort_keys=False)}
 
     # ---- Custom query tools (existing) ----
 
