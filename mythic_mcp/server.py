@@ -559,6 +559,647 @@ def _build_server(config: AppConfig) -> FastMCP:
             return resp["tagtype"]
         return resp
 
+    # ---- Event Feed (operationeventlog) tools ----
+
+    @mcp.tool()
+    async def get_event_logs(
+        ctx: Context,
+        level: Optional[str] = None,
+        source: Optional[str] = None,
+        resolved: Optional[bool] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Query the operational event log with optional filters.
+
+        Args:
+            level: Filter by level (e.g. "info", "warning", "debug").
+            source: Filter by source string.
+            resolved: Filter by resolved status.
+            limit: Maximum number of events to return (default 100).
+            offset: Number of events to skip for pagination.
+        """
+        await _ensure_connection(ctx)
+        where_clauses = ["deleted: {_eq: false}"]
+        if level is not None:
+            where_clauses.append(f'level: {{_eq: "{level}"}}')
+        if source is not None:
+            where_clauses.append(f'source: {{_eq: "{source}"}}')
+        if resolved is not None:
+            where_clauses.append(f"resolved: {{_eq: {str(resolved).lower()}}}")
+        where = ", ".join(where_clauses)
+        query = f"""
+        query GetEventLogs($limit: Int!, $offset: Int!) {{
+            operationeventlog(
+                where: {{{where}}},
+                order_by: {{timestamp: desc}},
+                limit: $limit,
+                offset: $offset
+            ) {{
+                id
+                timestamp
+                message
+                level
+                source
+                count
+                resolved
+                deleted
+                operator_id
+                operation_id
+                operator {{
+                    username
+                }}
+            }}
+            operationeventlog_aggregate(where: {{{where}}}) {{
+                aggregate {{
+                    count
+                }}
+            }}
+        }}
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"limit": limit, "offset": offset},
+        )
+        return {
+            "events": result.get("operationeventlog", []),
+            "total_count": (
+                result.get("operationeventlog_aggregate", {})
+                .get("aggregate", {})
+                .get("count", 0)
+            ),
+        }
+
+    @mcp.tool()
+    async def search_event_logs(
+        ctx: Context,
+        search_text: str,
+        level: Optional[str] = None,
+        resolved: Optional[bool] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Search event logs by message text using pattern matching.
+
+        Args:
+            search_text: Text pattern to search for in event messages (supports SQL ILIKE patterns with %).
+            level: Optional level filter.
+            resolved: Optional resolved status filter.
+            limit: Maximum number of results (default 50).
+        """
+        await _ensure_connection(ctx)
+        where_clauses = [
+            "deleted: {_eq: false}",
+            'message: {_ilike: $search}',
+        ]
+        if level is not None:
+            where_clauses.append(f'level: {{_eq: "{level}"}}')
+        if resolved is not None:
+            where_clauses.append(f"resolved: {{_eq: {str(resolved).lower()}}}")
+        where = ", ".join(where_clauses)
+        pattern = f"%{search_text}%" if "%" not in search_text else search_text
+        query = f"""
+        query SearchEventLogs($search: String!, $limit: Int!) {{
+            operationeventlog(
+                where: {{{where}}},
+                order_by: {{timestamp: desc}},
+                limit: $limit
+            ) {{
+                id
+                timestamp
+                message
+                level
+                source
+                count
+                resolved
+                operator_id
+                operator {{
+                    username
+                }}
+            }}
+        }}
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"search": pattern, "limit": limit},
+        )
+        return result.get("operationeventlog", [])
+
+    @mcp.tool()
+    async def send_event_log(
+        ctx: Context,
+        message: str,
+        level: str = "info",
+        source: str = "",
+    ) -> Dict[str, Any]:
+        """Send a new entry to the operational event log.
+
+        Args:
+            message: The event message text.
+            level: Log level - "info", "warning", or "debug" (default "info").
+            source: Optional source identifier for the event.
+        """
+        await _ensure_connection(ctx)
+        return await mythic.send_event_log_message(
+            mythic=session.instance,
+            message=message,
+            level=level,
+            source=source,
+        )
+
+    @mcp.tool()
+    async def resolve_event_log(
+        ctx: Context,
+        event_id: int,
+    ) -> Dict[str, Any]:
+        """Mark an event log entry as resolved.
+
+        Args:
+            event_id: The ID of the event log entry to resolve.
+        """
+        await _ensure_connection(ctx)
+        query = """
+        mutation ResolveEventLog($id: Int!) {
+            update_operationeventlog_by_pk(
+                pk_columns: {id: $id},
+                _set: {resolved: true}
+            ) {
+                id
+                resolved
+                message
+                level
+            }
+        }
+        """
+        return await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"id": event_id},
+        )
+
+    @mcp.tool()
+    async def unresolve_event_log(
+        ctx: Context,
+        event_id: int,
+    ) -> Dict[str, Any]:
+        """Mark an event log entry as unresolved (reopen it).
+
+        Args:
+            event_id: The ID of the event log entry to unresolve.
+        """
+        await _ensure_connection(ctx)
+        query = """
+        mutation UnresolveEventLog($id: Int!) {
+            update_operationeventlog_by_pk(
+                pk_columns: {id: $id},
+                _set: {resolved: false}
+            ) {
+                id
+                resolved
+                message
+                level
+            }
+        }
+        """
+        return await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"id": event_id},
+        )
+
+    @mcp.tool()
+    async def delete_event_log(
+        ctx: Context,
+        event_id: int,
+    ) -> Dict[str, Any]:
+        """Soft-delete an event log entry.
+
+        Args:
+            event_id: The ID of the event log entry to delete.
+        """
+        await _ensure_connection(ctx)
+        query = """
+        mutation DeleteEventLog($id: Int!) {
+            update_operationeventlog_by_pk(
+                pk_columns: {id: $id},
+                _set: {deleted: true}
+            ) {
+                id
+                deleted
+                message
+            }
+        }
+        """
+        return await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"id": event_id},
+        )
+
+    @mcp.tool()
+    async def subscribe_event_logs(
+        ctx: Context,
+        level: Optional[str] = None,
+        timeout: int = 60,
+        max_items: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Subscribe to real-time event log entries for a limited time window.
+
+        Args:
+            level: Optional filter by level (e.g. "info", "warning").
+            timeout: Seconds to listen before returning (default 60).
+            max_items: Maximum events to collect (default 100).
+        """
+        await _ensure_connection(ctx)
+        where_clause = "deleted: {_eq: false}"
+        if level is not None:
+            where_clause += f', level: {{_eq: "{level}"}}'
+        query = f"""
+        subscription EventLogStream {{
+            operationeventlog_stream(
+                batch_size: 10,
+                cursor: {{initial_value: {{timestamp: "now()"}}}},
+                where: {{{where_clause}}}
+            ) {{
+                id
+                timestamp
+                message
+                level
+                source
+                count
+                resolved
+                operator_id
+                operator {{
+                    username
+                }}
+            }}
+        }}
+        """
+        results: List[Dict[str, Any]] = []
+        async for batch in mythic.subscribe_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={},
+            timeout=timeout,
+        ):
+            if isinstance(batch, list):
+                results.extend(batch)
+            else:
+                results.append(batch)
+            if len(results) >= max_items:
+                break
+        return results
+
+    # ---- Workflow Eventing (eventgroup / eventstep) tools ----
+
+    @mcp.tool()
+    async def get_event_groups(
+        ctx: Context,
+        active: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get all workflow event groups (eventing definitions).
+
+        Args:
+            active: Optional filter by active status.
+        """
+        await _ensure_connection(ctx)
+        where_clause = ""
+        if active is not None:
+            where_clause = f"(where: {{active: {{_eq: {str(active).lower()}}}}})"
+        query = f"""
+        query GetEventGroups {{
+            eventgroup{where_clause} {{
+                id
+                name
+                description
+                active
+                trigger
+                trigger_data
+                keywords
+                operation_id
+                fileid
+                eventsteps {{
+                    id
+                    name
+                    description
+                    action
+                    action_data
+                    depends_on
+                    order
+                }}
+            }}
+        }}
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={},
+        )
+        return result.get("eventgroup", [])
+
+    @mcp.tool()
+    async def get_event_group_details(
+        ctx: Context,
+        event_group_id: int,
+    ) -> Dict[str, Any]:
+        """Get detailed information about a specific workflow event group including its steps.
+
+        Args:
+            event_group_id: The ID of the event group to query.
+        """
+        await _ensure_connection(ctx)
+        query = """
+        query GetEventGroupDetails($id: Int!) {
+            eventgroup_by_pk(id: $id) {
+                id
+                name
+                description
+                active
+                trigger
+                trigger_data
+                keywords
+                operation_id
+                fileid
+                eventsteps(order_by: {order: asc}) {
+                    id
+                    name
+                    description
+                    action
+                    action_data
+                    depends_on
+                    environment
+                    inputs
+                    outputs
+                    order
+                }
+                eventgroupinstances(order_by: {id: desc}, limit: 10) {
+                    id
+                    status
+                    trigger
+                    created_at
+                    updated_at
+                }
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"id": event_group_id},
+        )
+        data = result.get("eventgroup_by_pk")
+        if not data:
+            return {"error": f"No event group found with id={event_group_id}"}
+        return data
+
+    @mcp.tool()
+    async def get_event_group_instances(
+        ctx: Context,
+        event_group_id: Optional[int] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Get workflow execution instances.
+
+        Args:
+            event_group_id: Optional filter by event group ID.
+            status: Optional filter by status (e.g. "running", "completed", "error").
+            limit: Maximum instances to return (default 50).
+        """
+        await _ensure_connection(ctx)
+        where_parts = []
+        if event_group_id is not None:
+            where_parts.append(f"eventgroup_id: {{_eq: {event_group_id}}}")
+        if status is not None:
+            where_parts.append(f'status: {{_eq: "{status}"}}')
+        where_clause = ""
+        if where_parts:
+            where_clause = f"where: {{{', '.join(where_parts)}}},"
+        query = f"""
+        query GetEventGroupInstances($limit: Int!) {{
+            eventgroupinstance(
+                {where_clause}
+                order_by: {{id: desc}},
+                limit: $limit
+            ) {{
+                id
+                eventgroup_id
+                status
+                trigger
+                created_at
+                updated_at
+                eventgroup {{
+                    name
+                    trigger
+                }}
+                eventstepinstances(order_by: {{id: asc}}) {{
+                    id
+                    eventstep_id
+                    status
+                    start_timestamp
+                    end_timestamp
+                    stdout
+                    stderr
+                    eventstep {{
+                        name
+                        action
+                    }}
+                }}
+            }}
+        }}
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"limit": limit},
+        )
+        return result.get("eventgroupinstance", [])
+
+    @mcp.tool()
+    async def get_event_step_instance_output(
+        ctx: Context,
+        event_step_instance_id: int,
+    ) -> Dict[str, Any]:
+        """Get detailed output for a specific workflow step execution.
+
+        Args:
+            event_step_instance_id: The ID of the event step instance.
+        """
+        await _ensure_connection(ctx)
+        query = """
+        query GetEventStepInstanceOutput($id: Int!) {
+            eventstepinstance_by_pk(id: $id) {
+                id
+                eventstep_id
+                status
+                start_timestamp
+                end_timestamp
+                stdout
+                stderr
+                eventstep {
+                    name
+                    description
+                    action
+                    action_data
+                }
+                eventgroupinstance {
+                    id
+                    status
+                    eventgroup {
+                        name
+                    }
+                }
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"id": event_step_instance_id},
+        )
+        data = result.get("eventstepinstance_by_pk")
+        if not data:
+            return {"error": f"No event step instance found with id={event_step_instance_id}"}
+        return data
+
+    @mcp.tool()
+    async def toggle_event_group(
+        ctx: Context,
+        event_group_id: int,
+        active: bool,
+    ) -> Dict[str, Any]:
+        """Enable or disable a workflow event group.
+
+        Args:
+            event_group_id: The ID of the event group.
+            active: True to enable, False to disable.
+        """
+        await _ensure_connection(ctx)
+        query = """
+        mutation ToggleEventGroup($id: Int!, $active: Boolean!) {
+            update_eventgroup_by_pk(
+                pk_columns: {id: $id},
+                _set: {active: $active}
+            ) {
+                id
+                name
+                active
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={"id": event_group_id, "active": active},
+        )
+        data = result.get("update_eventgroup_by_pk")
+        if not data:
+            return {"error": f"No event group found with id={event_group_id}"}
+        return data
+
+    @mcp.tool()
+    async def trigger_event_group(
+        ctx: Context,
+        event_group_id: int,
+        environment: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Manually trigger a workflow event group to run.
+
+        Creates a new event group instance for a manual or keyword-triggered workflow.
+
+        Args:
+            event_group_id: The ID of the event group to trigger.
+            environment: Optional dictionary of environment variables for the run.
+        """
+        await _ensure_connection(ctx)
+        env_data = environment or {}
+        query = """
+        mutation TriggerEventGroup($eventgroup_id: Int!, $environment: jsonb!) {
+            insert_eventgroupinstance_one(
+                object: {
+                    eventgroup_id: $eventgroup_id,
+                    trigger: "manual",
+                    environment: $environment
+                }
+            ) {
+                id
+                status
+                trigger
+                created_at
+                eventgroup {
+                    name
+                }
+            }
+        }
+        """
+        result = await mythic.execute_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={
+                "eventgroup_id": event_group_id,
+                "environment": env_data,
+            },
+        )
+        data = result.get("insert_eventgroupinstance_one")
+        if not data:
+            return {"error": "Failed to trigger event group. Check that the event group exists and you have permission."}
+        return data
+
+    @mcp.tool()
+    async def subscribe_event_group_instances(
+        ctx: Context,
+        event_group_id: Optional[int] = None,
+        timeout: int = 60,
+        max_items: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Subscribe to real-time workflow execution updates.
+
+        Args:
+            event_group_id: Optional filter to a specific event group.
+            timeout: Seconds to listen (default 60).
+            max_items: Maximum instances to collect (default 50).
+        """
+        await _ensure_connection(ctx)
+        where_clause = ""
+        if event_group_id is not None:
+            where_clause = f"where: {{eventgroup_id: {{_eq: {event_group_id}}}}}, "
+        query = f"""
+        subscription EventGroupInstanceStream {{
+            eventgroupinstance_stream(
+                batch_size: 10,
+                cursor: {{initial_value: {{id: 0}}}},
+                {where_clause}
+            ) {{
+                id
+                eventgroup_id
+                status
+                trigger
+                created_at
+                updated_at
+                eventgroup {{
+                    name
+                }}
+            }}
+        }}
+        """
+        results: List[Dict[str, Any]] = []
+        async for batch in mythic.subscribe_custom_query(
+            mythic=session.instance,
+            query=query,
+            variables={},
+            timeout=timeout,
+        ):
+            if isinstance(batch, list):
+                results.extend(batch)
+            else:
+                results.append(batch)
+            if len(results) >= max_items:
+                break
+        return results
+
+    # ---- Custom query tools (existing) ----
+
     @mcp.tool()
     async def execute_custom_query(
         ctx: Context, query: str, variables: Optional[Dict[str, Any]] = None
