@@ -352,6 +352,74 @@ async def run_tests(args: argparse.Namespace) -> int:
             runner.record("issue_task", "SKIP", "allow_tasking=false")
             runner.record("wait_for_task_output", "SKIP", "allow_tasking=false")
 
+        # ---- Event Feed (operationeventlog) tests ----
+        ok, events_data, err = await runner.call("get_event_logs", {"limit": 10})
+        runner.record("get_event_logs", "PASS" if ok else "FAIL", err)
+
+        ok, _, err = await runner.call(
+            "search_event_logs", {"search_text": "callback", "limit": 5}
+        )
+        runner.record("search_event_logs", "PASS" if ok else "FAIL", err)
+
+        ok, send_result, err = await runner.call(
+            "send_event_log",
+            {"message": "MCP test event", "level": "info", "source": "mcp_test"},
+        )
+        runner.record("send_event_log", "PASS" if ok else "FAIL", err)
+
+        # Try to resolve/unresolve/delete an event from the log
+        event_id = None
+        events_parsed = _content_to_data(events_data)
+        if isinstance(events_parsed, dict):
+            event_list = events_parsed.get("events", [])
+            if event_list:
+                event_id = event_list[0].get("id")
+        elif isinstance(events_parsed, list) and events_parsed:
+            event_id = events_parsed[0].get("id")
+
+        if event_id is not None:
+            ok, _, err = await runner.call("resolve_event_log", {"event_id": event_id})
+            runner.record("resolve_event_log", "PASS" if ok else "FAIL", err)
+
+            ok, _, err = await runner.call("unresolve_event_log", {"event_id": event_id})
+            runner.record("unresolve_event_log", "PASS" if ok else "FAIL", err)
+        else:
+            runner.record("resolve_event_log", "SKIP", "no events available")
+            runner.record("unresolve_event_log", "SKIP", "no events available")
+
+        ok, _, err = await runner.call(
+            "subscribe_event_logs", {"timeout": 2, "max_items": 5}
+        )
+        runner.record("subscribe_event_logs", "PASS" if ok else "FAIL", err)
+
+        # ---- Workflow Eventing (eventgroup) tests ----
+        ok, groups_data, err = await runner.call("get_event_groups", {})
+        runner.record("get_event_groups", "PASS" if ok else "FAIL", err)
+
+        group_id = None
+        groups_parsed = _content_to_data(groups_data)
+        if isinstance(groups_parsed, list) and groups_parsed:
+            group_id = groups_parsed[0].get("id")
+
+        if group_id is not None:
+            ok, _, err = await runner.call(
+                "get_event_group_details", {"event_group_id": group_id}
+            )
+            runner.record("get_event_group_details", "PASS" if ok else "FAIL", err)
+        else:
+            runner.record("get_event_group_details", "SKIP", "no event groups")
+
+        ok, _, err = await runner.call("get_event_group_instances", {"limit": 10})
+        runner.record("get_event_group_instances", "PASS" if ok else "FAIL", err)
+
+        if group_id is not None:
+            ok, _, err = await runner.call(
+                "toggle_event_group", {"event_group_id": group_id, "active": True}
+            )
+            runner.record("toggle_event_group", "PASS" if ok else "FAIL", err)
+        else:
+            runner.record("toggle_event_group", "SKIP", "no event groups")
+
         if args.allow_admin:
             op_name = f"mcp_test_{int(datetime.now().timestamp())}"
             ok, op, err = await runner.call("create_operation", {"operation_name": op_name})
